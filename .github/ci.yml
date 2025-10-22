@@ -1,0 +1,99 @@
+name: CI - Tests & Reports
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write     # required if you publish to gh-pages
+  pages: write        # required for GitHub Pages publish
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests -> generate Allure results + pytest-html
+        run: |
+          # create directories
+          mkdir -p allure-results report
+          # run pytest; adjust flags/path to match your test layout
+          pytest --maxfail=1 --disable-warnings --alluredir=allure-results --html=report/report.html --self-contained-html
+
+      - name: Upload pytest-html report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-html-report
+          path: report/report.html
+
+      - name: Upload Allure results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+
+  allure_publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download Allure results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+
+      # Generate Allure report and save to `allure-report` folder
+      - name: Generate Allure HTML (using andgineer/allure-report)
+        uses: andgineer/allure-report@v3
+        with:
+          results: 'allure-results'
+          report-path: 'allure-report'
+
+      - name: Upload generated Allure HTML as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-html
+          path: allure-report
+
+  # Optional: publish Allure report to GitHub Pages (so it's viewable in browser)
+  publish_pages:
+    needs: allure_publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download generated Allure HTML artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-html
+          path: site
+
+      - name: Deploy to GitHub Pages
+        uses: actions/configure-pages@v3
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v1
+        with:
+          path: site/allure-report
+
+      - name: Publish to GitHub Pages
+        uses: actions/deploy-pages@v1
