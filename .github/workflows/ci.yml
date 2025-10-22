@@ -1,4 +1,4 @@
-name: CI - Tests & Reports
+name: Run Edge Tests and Publish Allure & HTML Reports
 
 on:
   push:
@@ -7,93 +7,195 @@ on:
     branches: [ main ]
 
 permissions:
-  contents: write     # required if you publish to gh-pages
-  pages: write        # required for GitHub Pages publish
-  id-token: write
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.10'
+  ALLURE_VERSION: '2.35.1'    # change if you prefer another valid release
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Upgrade pip & Install dependencies (include pytest-html)
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if (Test-Path 'requirements.txt') {
+            python -m pip install -r requirements.txt
+          } else {
+            Write-Host "requirements.txt not found, skipping"
+          }
+          # ensure allure-pytest and pytest-html are available
+          python -m pip install allure-pytest pytest-html
 
-      - name: Run tests -> generate Allure results + pytest-html
+      - name: Create directories
+        shell: pwsh
         run: |
-          # create directories
-          mkdir -p allure-results report
-          # run pytest; adjust flags/path to match your test layout
-          pytest --maxfail=1 --disable-warnings --alluredir=allure-results --html=report/report.html --self-contained-html
+          if (-not (Test-Path logs)) { New-Item -ItemType Directory -Path logs | Out-Null }
+          if (-not (Test-Path allure-results)) { New-Item -ItemType Directory -Path allure-results | Out-Null }
+          if (-not (Test-Path allure-report)) { New-Item -ItemType Directory -Path allure-report | Out-Null }
+          if (-not (Test-Path report)) { New-Item -ItemType Directory -Path report | Out-Null }
+          if (-not (Test-Path site)) { New-Item -ItemType Directory -Path site | Out-Null }
 
-      - name: Upload pytest-html report artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pytest-html-report
-          path: report/report.html
+      - name: Run Pytest (produce Allure results + pytest HTML)
+        shell: pwsh
+        run: |
+          # Run pytest and generate:
+          #  - Allure results in allure-results
+          #  - A self-contained pytest HTML report at report/pytest-report.html
+          python -m pytest --alluredir=allure-results --html=report/pytest-report.html --self-contained-html --maxfail=1 --disable-warnings -v
 
-      - name: Upload Allure results artifact
+      - name: Install Allure CLI (Windows) and export envs
+        shell: pwsh
+        run: |
+          $version = "${{ env.ALLURE_VERSION }}"
+          Write-Host "Requested Allure version: $version"
+
+          $workspace = "${{ github.workspace }}"
+          $destRoot = Join-Path $workspace 'allure'
+          $zip = Join-Path $env:TEMP "allure-$version.zip"
+          $url = "https://github.com/allure-framework/allure2/releases/download/$version/allure-$version.zip"
+          Write-Host "Downloading Allure from: $url"
+
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+          } catch {
+            Write-Error "Failed to download Allure. Check that version $version exists. Exception: $_"
+            exit 1
+          }
+
+          if (-not (Test-Path $zip)) {
+            Write-Error "Allure zip not found at $zip"
+            exit 1
+          }
+
+          $size = (Get-Item $zip).Length
+          Write-Host "Downloaded file size: $size bytes"
+          if ($size -lt 1000) {
+            Write-Error "Downloaded Allure archive looks too small. Aborting."
+            exit 1
+          }
+
+          if (Test-Path $destRoot) { Remove-Item -Recurse -Force $destRoot }
+          New-Item -ItemType Directory -Path $destRoot | Out-Null
+
+          Write-Host "Extracting Allure to $destRoot..."
+          Expand-Archive -LiteralPath $zip -DestinationPath $destRoot -Force
+
+          $firstFolder = Get-ChildItem -Directory $destRoot | Select-Object -First 1
+          if ($null -eq $firstFolder) {
+            Write-Error "Could not find extracted Allure folder under $destRoot"
+            exit 1
+          }
+          $allureHome = $firstFolder.FullName
+          $bin = Join-Path $allureHome 'bin'
+
+          if (-not (Test-Path $bin)) {
+            Write-Error "Could not find Allure bin directory at $bin"
+            exit 1
+          }
+
+          Write-Host "Allure home: $allureHome"
+          Write-Host "Allure bin: $bin"
+
+          # Persist variables for next steps
+          Add-Content -Path $env:GITHUB_ENV -Value "ALLURE_HOME=$allureHome"
+          Add-Content -Path $env:GITHUB_ENV -Value "PATH=$bin;$env:PATH"
+
+      - name: Debug listing before generating reports
+        shell: pwsh
+        run: |
+          Write-Host "Contents of workspace root:"
+          Get-ChildItem -Force | Format-Table
+          Write-Host "Contents of allure-results (should contain xml/json files):"
+          if (Test-Path allure-results) {
+            Get-ChildItem -Recurse allure-results | Select-Object FullName,Length | Format-Table -AutoSize
+          } else {
+            Write-Warning "allure-results not found"
+          }
+          Write-Host "Contents of report (pytest html):"
+          if (Test-Path report) { Get-ChildItem -Recurse report | Select-Object FullName,Length | Format-Table -AutoSize } else { Write-Warning "report folder missing" }
+
+      - name: Generate Allure HTML report
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "allure-results") -or ((Get-ChildItem -Recurse allure-results | Measure-Object).Count -eq 0)) {
+            Write-Warning "No Allure results found — skipping Allure HTML generation."
+            exit 0
+          }
+          Write-Host "Generating Allure HTML report into allure-report..."
+          & "$env:ALLURE_HOME\bin\allure.bat" generate allure-results -o allure-report --clean
+          Write-Host "Allure report generated. Listing files:"
+          Get-ChildItem -Recurse allure-report | Select-Object FullName,Length | Format-Table -AutoSize
+
+      - name: Fix Allure index base href (make resources load correctly)
+        shell: pwsh
+        run: |
+          $index = Join-Path $PWD 'allure-report\index.html'
+          if (-not (Test-Path $index)) {
+            Write-Warning "Allure index.html not found at $index — skipping base fix"
+            exit 0
+          }
+          Write-Host "Patching allure-report/index.html to include <base href='./'>"
+          $content = Get-Content -Raw -Path $index
+          $new = $content -replace '(?i)(<head\b[^>]*>)', '$1`n    <base href="./">'
+          Set-Content -Path $index -Value $new -Encoding UTF8
+          Write-Host "Patched index.html (showing first 40 lines):"
+          Get-Content -Path $index -Head 40 | ForEach-Object { Write-Host $_ }
+
+      - name: Prepare site folder (include both reports)
+        shell: pwsh
+        run: |
+          # Clean site folder
+          if (Test-Path site) { Remove-Item -Recurse -Force site }
+          New-Item -ItemType Directory -Path site | Out-Null
+
+          # Copy allure-report into site/allure-report (if exists)
+          if (Test-Path allure-report) {
+            New-Item -ItemType Directory -Path site\allure-report | Out-Null
+            Copy-Item -Recurse -Force -Path (Join-Path $PWD 'allure-report\*') -Destination (Join-Path $PWD 'site\allure-report')
+          } else {
+            Write-Warning "allure-report not found; skipping copy"
+          }
+
+          # Copy pytest-html report into site/pytest-report (single file)
+          if (Test-Path report\pytest-report.html) {
+            New-Item -ItemType Directory -Path site\pytest-report | Out-Null
+            Copy-Item -Path (Join-Path $PWD 'report\pytest-report.html') -Destination (Join-Path $PWD 'site\pytest-report\index.html')
+          } else {
+            Write-Warning "pytest HTML report not found at report\\pytest-report.html"
+          }
+
+          Write-Host "Site folder structure:"
+          Get-ChildItem -Recurse site | Select-Object FullName,Length | Format-Table -AutoSize
+
+      - name: Upload Allure results (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: allure-results
           path: allure-results
 
-  allure_publish:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Download Allure results artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: allure-results
-          path: allure-results
-
-      # Generate Allure report and save to `allure-report` folder
-      - name: Generate Allure HTML (using andgineer/allure-report)
-        uses: andgineer/allure-report@v3
-        with:
-          results: 'allure-results'
-          report-path: 'allure-report'
-
-      - name: Upload generated Allure HTML as artifact
+      - name: Upload HTML reports (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: allure-html
-          path: allure-report
+          name: html-reports
+          path: |
+            allure-report
+            report
 
-  # Optional: publish Allure report to GitHub Pages (so it's viewable in browser)
-  publish_pages:
-    needs: allure_publish
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Download generated Allure HTML artifact
-        uses: actions/download-artifact@v4
+      - name: Deploy site (Allure + pytest HTML) to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
         with:
-          name: allure-html
-          path: site
-
-      - name: Deploy to GitHub Pages
-        uses: actions/configure-pages@v3
-
-      - name: Upload to GitHub Pages
-        uses: actions/upload-pages-artifact@v1
-        with:
-          path: site/allure-report
-
-      - name: Publish to GitHub Pages
-        uses: actions/deploy-pages@v1
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: site
+          publish_branch: gh-pages
