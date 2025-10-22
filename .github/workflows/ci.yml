@@ -53,45 +53,43 @@ jobs:
           # --reruns 1 will retry a single transient test failure automatically.
           python -m pytest --alluredir=allure-results --html=report/pytest-report.html --self-contained-html -v --maxfail=1 --disable-warnings --reruns 1 --reruns-delay 2
 
-      # Upload allure-results (helpful for debugging and consumed by the next action)
-      - name: Upload allure-results artifact (temporary)
-        uses: actions/upload-artifact@v4
-        with:
-          name: allure-results
-          path: allure-results
+      - name: Install Allure CLI (Windows) and export envs
+        shell: pwsh
+        run: |
+          $version = "${{ env.ALLURE_VERSION }}"
+          $workspace = "${{ github.workspace }}"
+          $destRoot = Join-Path $workspace 'allure'
+          $zip = Join-Path $env:TEMP "allure-$version.zip"
+          $url = "https://github.com/allure-framework/allure2/releases/download/$version/allure-$version.zip"
+          try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop } catch { Write-Error "Download failed: $_"; exit 1 }
+          if (Test-Path $destRoot) { Remove-Item -Recurse -Force $destRoot }
+          New-Item -ItemType Directory -Path $destRoot | Out-Null
+          Expand-Archive -LiteralPath $zip -DestinationPath $destRoot -Force
+          $firstFolder = Get-ChildItem -Directory $destRoot | Select-Object -First 1
+          if ($null -eq $firstFolder) { Write-Error "Allure extraction failed"; exit 1 }
+          $allureHome = $firstFolder.FullName
+          Add-Content -Path $env:GITHUB_ENV -Value "ALLURE_HOME=$allureHome"
+          Add-Content -Path $env:GITHUB_ENV -Value "PATH=$allureHome\bin;$env:PATH"
 
-      - name: Debug listing after pytest
+      - name: Debug listing before generating reports
         shell: pwsh
         run: |
           Write-Host "Workspace root:"
           Get-ChildItem -Force | Format-Table
-          Write-Host "Allure results contents (top):"
+          Write-Host "Allure results:"
           if (Test-Path allure-results) { Get-ChildItem -Recurse allure-results | Select-Object FullName,Length | Format-Table -AutoSize } else { Write-Warning "allure-results missing" }
           Write-Host "pytest-html report:"
           if (Test-Path report) { Get-ChildItem -Recurse report | Select-Object FullName,Length | Format-Table -AutoSize } else { Write-Warning "report folder missing" }
 
-      - name: Generate Allure HTML using andgineer action
-        uses: andgineer/allure-report@v3
-        with:
-          results: 'allure-results'     # folder containing Allure results
-          report-path: 'allure-report'  # output path for generated site
-
-      - name: Verify generated Allure report files
+      - name: Generate Allure HTML report
         shell: pwsh
         run: |
-          Write-Host "Checking generated allure-report folder..."
-          if (Test-Path allure-report) {
-            Get-ChildItem -Recurse allure-report | Select-Object FullName,Length | Format-Table -AutoSize
-          } else {
-            Write-Error "allure-report not found (generation failed)"
-            exit 1
+          if (-not (Test-Path "allure-results") -or ((Get-ChildItem -Recurse allure-results | Measure-Object).Count -eq 0)) {
+            Write-Warning "No Allure results found — skipping Allure HTML generation."
+            exit 0
           }
-          if (-not (Test-Path allure-report\data) -or ((Get-ChildItem -Recurse allure-report\data | Measure-Object).Count -eq 0)) {
-            Write-Error "allure-report/data is missing or empty; generation failed or results were empty"
-            exit 1
-          } else {
-            Write-Host "allure-report/data present and non-empty."
-          }
+          & "$env:ALLURE_HOME\bin\allure.bat" generate allure-results -o allure-report --clean
+          Get-ChildItem -Recurse allure-report | Select-Object FullName,Length | Format-Table -AutoSize
 
       - name: Fix Allure index base href (make resources load correctly)
         shell: pwsh
@@ -101,9 +99,8 @@ jobs:
             $content = Get-Content -Raw -Path $index
             $new = $content -replace '(?i)(<head\b[^>]*>)', '$1`n    <base href="./">'
             Set-Content -Path $index -Value $new -Encoding UTF8
-            Write-Host "Patched allure-report/index.html base href."
           } else {
-            Write-Warning "allure-report index.html not found; skipping base href fix"
+            Write-Warning "allure index not found; skipping base href fix"
           }
 
       - name: Prepare site folder (include both reports)
@@ -111,21 +108,14 @@ jobs:
         run: |
           if (Test-Path site) { Remove-Item -Recurse -Force site }
           New-Item -ItemType Directory -Path site | Out-Null
-
           if (Test-Path allure-report) {
             New-Item -ItemType Directory -Path site\allure-report | Out-Null
             Copy-Item -Recurse -Force -Path (Join-Path $PWD 'allure-report\*') -Destination (Join-Path $PWD 'site\allure-report')
-          } else {
-            Write-Warning "allure-report missing; site will not include Allure"
           }
-
           if (Test-Path report\pytest-report.html) {
             New-Item -ItemType Directory -Path site\pytest-report | Out-Null
             Copy-Item -Path (Join-Path $PWD 'report\pytest-report.html') -Destination (Join-Path $PWD 'site\pytest-report\index.html')
-          } else {
-            Write-Warning "pytest HTML report missing; site will not include pytest html"
           }
-
           Get-ChildItem -Recurse site | Select-Object FullName,Length | Format-Table -AutoSize
 
       - name: Upload Allure results
