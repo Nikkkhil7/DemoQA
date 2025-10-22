@@ -1,4 +1,4 @@
-name: Run Edge Tests and Publish Allure & HTML Reports
+name: Run Chrome Tests and Publish Allure & HTML Reports
 
 on:
   push:
@@ -11,7 +11,8 @@ permissions:
 
 env:
   PYTHON_VERSION: '3.10'
-  ALLURE_VERSION: '2.35.1'    # change if you prefer another valid release
+  ALLURE_VERSION: '2.35.1'    # change if needed
+  RUN_HEADLESS: 'true'        # tests should honor this (run Chrome headless in CI)
 
 jobs:
   test:
@@ -26,7 +27,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Upgrade pip & Install dependencies (include pytest-html)
+      - name: Upgrade pip & Install dependencies (include pytest-html + webdriver-manager)
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
@@ -35,8 +36,8 @@ jobs:
           } else {
             Write-Host "requirements.txt not found, skipping"
           }
-          # ensure allure-pytest and pytest-html are available
-          python -m pip install allure-pytest pytest-html
+          # ensure Allure & pytest-html & webdriver-manager are available
+          python -m pip install allure-pytest pytest-html webdriver-manager
 
       - name: Create directories
         shell: pwsh
@@ -49,10 +50,11 @@ jobs:
 
       - name: Run Pytest (produce Allure results + pytest HTML)
         shell: pwsh
+        env:
+          RUN_HEADLESS: ${{ env.RUN_HEADLESS }}
         run: |
-          # Run pytest and generate:
-          #  - Allure results in allure-results
-          #  - A self-contained pytest HTML report at report/pytest-report.html
+          # If your tests use webdriver-manager (ChromeDriverManager) they will fetch the matching driver.
+          # Generate Allure results and a self-contained pytest-html report.
           python -m pytest --alluredir=allure-results --html=report/pytest-report.html --self-contained-html --maxfail=1 --disable-warnings -v
 
       - name: Install Allure CLI (Windows) and export envs
